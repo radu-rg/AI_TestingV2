@@ -1,30 +1,39 @@
-import streamlit as st
-import requests
 import json  # Added for parsing the data stream
+import os
+from urllib.parse import urlparse
+
+import requests
+import streamlit as st
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 # This URL will change every time you restart ngrok (on the free plan)
-API_URL = "https://mandie-erasable-parallel.ngrok-free.dev"
-MODEL = "mistral"
+DEFAULT_API_URL = os.environ.get("LMSTUDIO_API_URL", "https://mandie-erasable-parallel.ngrok-free.dev")
+DEFAULT_MODEL = os.environ.get("LMSTUDIO_MODEL", "mistral")
+
+PREDEFINED_MODELS = [
+    "mistral",
+    "llama-3",
+    "phi-2",
+]
 
 
 # =============================================================================
 # API COMMUNICATION (NOW A STREAMING GENERATOR)
 # =============================================================================
 
-def send_message_stream(messages):
+def send_message_stream(messages, api_url, model):
     """
     Sends the chat history to the API and yields the response tokens
     as they are generated.
     """
     try:
         response = requests.post(
-            API_URL,
+            api_url,
             headers={"Content-Type": "application/json"},
             json={
-                "model": MODEL,
+                "model": model,
                 "messages": messages,
                 "temperature": 0.7,
                 "max_tokens": 512,
@@ -69,7 +78,9 @@ def send_message_stream(messages):
     except requests.exceptions.RequestException as e:
         # Handle network errors (e.g., connection refused)
         st.error(f"⚠️ API Error: {e}")
-        st.error("Is LM Studio running? Make sure the server is started and the API_URL is correct.")
+        st.error(
+            f"Is LM Studio running? Make sure the server at {api_url} is started and the API URL is correct."
+        )
         yield f"⚠️ API Error: {e}."  # Yield error to display it in the chat
     except Exception as e:
         yield f"⚠️ An unknown error occurred: {e}"
@@ -109,6 +120,67 @@ personas = {
 persona_choice = st.selectbox("🧠 Choose a Persona:", list(personas.keys()))
 system_prompt = personas[persona_choice]
 
+# --- Connection Defaults & Sidebar Configuration ---
+if "api_url" not in st.session_state:
+    st.session_state.api_url = DEFAULT_API_URL
+
+if "model" not in st.session_state:
+    st.session_state.model = DEFAULT_MODEL
+
+url_is_valid = False
+custom_model_is_valid = True
+chosen_model = st.session_state.model
+
+with st.sidebar:
+    st.header("Connection Settings")
+
+    api_url_input = st.text_input("LM Studio API URL", value=st.session_state.api_url)
+    stripped_api_url = api_url_input.strip()
+
+    if not stripped_api_url:
+        st.error("API URL is required.")
+    else:
+        parsed_url = urlparse(stripped_api_url)
+        if parsed_url.scheme and parsed_url.netloc:
+            url_is_valid = True
+        else:
+            st.error("Please enter a valid API URL (including scheme, e.g., https://host).")
+
+    model_options = list(PREDEFINED_MODELS)
+    if st.session_state.model not in model_options:
+        model_options.insert(0, st.session_state.model)
+    model_options.append("Custom")
+
+    model_choice = st.selectbox(
+        "Model",
+        options=model_options,
+        index=model_options.index(st.session_state.model)
+        if st.session_state.model in model_options
+        else len(model_options) - 1,
+    )
+
+    if model_choice == "Custom":
+        custom_model_name = st.text_input(
+            "Custom model name",
+            value="" if st.session_state.model in PREDEFINED_MODELS else st.session_state.model,
+        ).strip()
+
+        if custom_model_name:
+            chosen_model = custom_model_name
+        else:
+            st.error("Custom model name cannot be empty.")
+            custom_model_is_valid = False
+    else:
+        chosen_model = model_choice
+
+has_validation_errors = not url_is_valid or not custom_model_is_valid
+
+if url_is_valid:
+    st.session_state.api_url = stripped_api_url
+
+if custom_model_is_valid:
+    st.session_state.model = chosen_model
+
 # --- Session State (Memory) Management ---
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "system", "content": system_prompt}]
@@ -127,23 +199,34 @@ for msg in st.session_state.messages[1:]:
 # --- Chat Input and Response Logic (Updated for Streaming) ---
 if prompt := st.chat_input("Type your message here..."):
 
-    # 1. Add user's message to the session state
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    if has_validation_errors:
+        with st.chat_message("assistant"):
+            st.error("Please resolve the sidebar configuration errors before sending a message.")
+    else:
+        # 1. Add user's message to the session state
+        st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # 2. Display user's message in the chat UI
-    st.chat_message("user").write(prompt)
+        # 2. Display user's message in the chat UI
+        st.chat_message("user").write(prompt)
 
-    # 3. Get and display the assistant's streaming response
-    with st.chat_message("assistant"):
-        # `st.write_stream` takes a generator (our function) and
-        # writes the yielded chunks to the UI as they arrive.
-        # It also returns the *full, concatenated* string at the end.
-        reply = st.write_stream(send_message_stream(st.session_state.messages))
+        # 3. Get and display the assistant's streaming response
+        with st.chat_message("assistant"):
+            # `st.write_stream` takes a generator (our function) and
+            # writes the yielded chunks to the UI as they arrive.
+            # It also returns the *full, concatenated* string at the end.
+            reply = st.write_stream(
+                send_message_stream(
+                    st.session_state.messages,
+                    st.session_state.api_url,
+                    st.session_state.model,
+                )
+            )
 
-    # 4. Add the *full* assistant response to the session state
-    #    (Only if it wasn't an error)
-    if not reply.startswith("⚠️"):
-        st.session_state.messages.append({"role": "assistant", "content": reply})
+        # 4. Add the *full* assistant response to the session state
+        #    (Only if it wasn't an error)
+        if not reply.startswith("⚠️"):
+            st.session_state.messages.append({"role": "assistant", "content": reply})
 
 # --- Reset Button ---
 st.button("🧹 Reset Chat", on_click=reset_chat)
+
